@@ -14,6 +14,9 @@ HTTP API for the **relevant-priors-v1** challenge. For each (current examination
 prior examination) pair the service predicts whether the prior should be shown
 to the radiologist.
 
+**Live endpoint:** <https://wothmag07-new-latern-space.hf.space/predict>
+(`GET /healthz` returns liveness; `POST /predict` is the contract endpoint).
+
 ## API
 
 ```http
@@ -53,7 +56,7 @@ Public-split accuracy:
 | Hybrid (heuristic + `gpt-4o-mini`) | 0.9491 | previous architecture |
 | **LightGBM classifier (5-fold OOF CV)** | **0.9603** | shipped predictor — honest out-of-sample estimate |
 
-See `EXPERIMENT.md` for the full experiment table, ablations, embeddings
+See `experiments.md` for the full experiment table, ablations, embeddings
 comparison, and forward-looking methodology suggestions.
 
 ## Pipeline

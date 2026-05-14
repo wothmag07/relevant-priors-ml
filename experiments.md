@@ -1,5 +1,7 @@
 # Relevant Priors — Experiments & Next Steps
 
+**Live endpoint:** <https://wothmag07-new-latern-space.hf.space/predict>
+
 ## Problem
 
 For each `(current_examination, prior_examination)` pair, predict whether the
