@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.cache/*
+!.cache/llm_cache.json
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pkl
+!app/classifier_model.pkl
+.DS_Store
