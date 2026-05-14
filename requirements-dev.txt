@@ -3,6 +3,7 @@
 -r requirements.txt
 
 pytest>=8.0
+httpx>=0.27   # required by fastapi.testclient (starlette dep), not pulled in transitively
 
 # Plotting for eval/plot_metrics.py
 matplotlib>=3.8
