@@ -1,4 +1,4 @@
----
+<!---
 title: Relevant Priors Classifier
 emoji: 🩻
 colorFrom: indigo
@@ -6,7 +6,7 @@ colorTo: gray
 sdk: docker
 app_port: 7860
 pinned: false
----
+--->
 
 [![CI](https://github.com/wothmag07/relevant-priors-ml/actions/workflows/ci.yml/badge.svg)](https://github.com/wothmag07/relevant-priors-ml/actions/workflows/ci.yml)
 [![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/release/python-3110/)
