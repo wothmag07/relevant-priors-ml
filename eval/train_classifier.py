@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np  # noqa: E402
 import lightgbm as lgb  # noqa: E402
+from sklearn.metrics import average_precision_score, roc_auc_score  # noqa: E402
 from sklearn.model_selection import GroupKFold  # noqa: E402
 
 from app.features import featurize, feature_names  # noqa: E402
@@ -152,8 +153,13 @@ def main():
     for t, p in zip(y, pred):
         confusion[(bool(t), bool(p))] += 1
 
+    roc_auc = roc_auc_score(y, oof_proba)
+    pr_auc = average_precision_score(y, oof_proba)
+
     print(f"\n=== Out-of-fold totals (threshold={args.threshold}) ===")
     print(f"accuracy:   {acc:.4f}  ({correct}/{total})")
+    print(f"ROC-AUC:    {roc_auc:.4f}")
+    print(f"PR-AUC:     {pr_auc:.4f}  (positive rate baseline = {y.mean():.4f})")
     print("confusion (true, pred): count")
     for (t, p), n in sorted(confusion.items()):
         print(f"  ({t!s:5}, {p!s:5}) {n}")
