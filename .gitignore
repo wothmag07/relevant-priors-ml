@@ -14,3 +14,6 @@ venv/
 *.pkl
 !app/classifier_model.pkl
 .DS_Store
+
+# Project-private Claude Code guidance — not part of the submission
+CLAUDE.md
