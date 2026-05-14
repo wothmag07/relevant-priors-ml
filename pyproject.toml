@@ -1,0 +1,44 @@
+[project]
+name = "relevant-priors-ml"
+version = "0.1.0"
+description = "Radiology relevant-priors classifier (FastAPI + LightGBM)"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = {file = "LICENSE"}
+authors = [{name = "wothmag07"}]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["app/classifier_model.pkl", "docs", ".cache"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "SIM",  # simplify
+    "C4",   # comprehensions
+]
+ignore = [
+    "E501",  # line length — handled by formatter where it matters
+    "B008",  # FastAPI uses Depends(...) in defaults
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "eval"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["app", "eval"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+# Strictness deliberately moderate: this is an applied ML project, not a library.
+# Cranking strict_optional + disallow_untyped_defs would force annotations into
+# numerical helper code that doesn't benefit from them.
