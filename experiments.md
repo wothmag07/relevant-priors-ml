@@ -34,98 +34,175 @@ Implications:
 
 ## Final architecture
 
-Three layered tiers in `app/classifier.py`. The first tier that succeeds wins.
+Two layered tiers in `app/classifier.py`. The first to succeed wins.
 
 1. **LightGBM classifier** (`app/classifier_model.py`, `app/features.py`) —
    primary path. Trained offline on the public split with ~120 engineered
    features per pair: region one-hots, modality, contrast, laterality, date
-   deltas, description text features, and the heuristic's own prediction +
-   confidence. Deterministic, ~2 ms/pair, no API dependency.
+   deltas, description-text features, and the heuristic's own prediction +
+   confidence as inputs. Deterministic, ~2 ms/pair, no API dependency at
+   inference. Trained with `seed=42` + `deterministic=True` so two runs
+   produce identical fold accuracies.
+2. **Heuristic-only fallback** (`app/parser.py`, `app/heuristic.py`) — fires
+   if `classifier_model.pkl` is missing on a deploy or if a
+   feature-schema-drift check at load time refuses the model. Pure regex +
+   region-set overlap, no learned component.
+3. **All-False fallback** (`app/main.py`) — final safety net at the FastAPI
+   layer. If both tiers above fail or the request exceeds a 300 s wall-clock
+   budget, one all-False prediction per prior is returned (76 % baseline).
+   No prediction is ever skipped.
 
-2. **Heuristic + LLM hybrid** (`app/parser.py`, `app/heuristic.py`,
-   `app/llm.py`) — fallback when the LightGBM model file is missing on a deploy.
-   Heuristic tags each description into region / modality / contrast / laterality;
-   pairs with heuristic confidence `< 0.85` are batched per case to `gpt-4o-mini`
-   with `response_format=json_object`. Results are cached on disk keyed by
-   `(curr_description, prior_description)`.
+The wall-clock budget is enforced with `asyncio.wait_for(..., timeout=300)`;
+on expiry, in-flight tasks are cancelled and tier 3 fires. This is the hard
+guarantee against the evaluator's 360 s timeout regardless of what happens
+upstream.
 
-3. **All-False fallback** (`app/main.py`) — final safety net. If both higher
-   tiers fail, the request handler returns one prediction per prior with
-   `predicted_is_relevant=False`. This is the 76 % baseline — better than
-   skipping (which scores 0 %).
+## Pipeline
 
-The wall-clock budget is bounded at 300 s via `asyncio.wait_for`; on expiry,
-in-flight tasks are cancelled and tier 3 fires. This is the hard guarantee
-against the evaluator's 360 s timeout regardless of what happens upstream.
+Two phases that share the same feature-engineering code in
+`app/features.py`, which guarantees train/inference parity.
+
+### Training (offline, one-shot)
+
+```text
+relevant_priors_public.json (27,614 labeled pairs)
+        │
+        ▼
+load_pairs()  →  list of {curr_desc, prior_desc, curr_date, prior_date, label}
+        │
+        ▼
+For each pair: featurize(...)
+       │   parse_description(curr_desc) → StudyTags(regions, modality, ...)
+       │   parse_description(prior_desc) → StudyTags(...)
+       │   classify_pair(curr_tags, prior_tags) → HeuristicResult (used as features)
+       ▼
+   ~120 numeric features per pair
+        │
+        ▼
+X (27614 × 121),  y (27614,)
+        │
+        ▼
+GroupKFold (groups = unique curr+prior text pair, stable across runs)
+   → 5-fold OOF CV (deterministic, seed=42)
+        │
+        ▼
+lgb.train(full_data) → app/classifier_model.pkl    (1 MB pickle)
+```
+
+### Inference (online, every `POST /predict` request)
+
+```text
+POST /predict {cases: [...]}
+        │
+        ▼
+app/main.py::_handle      ← wraps in 300 s wall-clock budget
+        │
+        ▼
+app/classifier.py::predict_cases_async
+        │
+        ▼
+┌──────────────────────────────────┐
+│ Tier 1: LightGBM                 │ ← fires if classifier_model.pkl is present
+│   featurize each pair            │   AND its feature schema matches features.py
+│   model.predict(X)               │
+│   bool[i] = proba[i] >= 0.5      │
+└──────────┬───────────────────────┘
+           │ model missing or schema drift? ↓
+┌──────────▼───────────────────────┐
+│ Tier 2: heuristic-only           │ ← parser → classify_pair → bool
+└──────────┬───────────────────────┘
+           │ tier 2 raises or budget expires? ↓
+┌──────────▼───────────────────────┐
+│ Tier 3: all-False                │ ← never skips, returns 76 % baseline
+└──────────────────────────────────┘
+        │
+        ▼
+HTTP 200 {predictions: [...]}
+```
 
 ## Experiments
 
-All numbers are on the full public split (996 cases / 27,614 pairs).
-Wall time was measured on a Windows laptop. The classifier row reports
-**out-of-fold accuracy from 5-fold GroupKFold CV** (groups = unique
-description pairs), which is the honest unbiased estimate; the
-training-set fit on the same data is 0.98+ but is not a generalisation
-estimate and is not what we claim.
+All numbers below are on the full public split (996 cases / 27,614 pairs).
+The classifier row reports **out-of-fold accuracy from 5-fold GroupKFold CV**
+(groups = unique description-pair strings) — the unbiased generalisation
+estimate. Training-set fit is also shown for transparency but is not what
+we claim.
 
-| # | Predictor | Accuracy | Δ vs always-False | Wall time | Notes |
-| --- | --- | --- | --- | --- | --- |
-| 0 | `always_false` (sanity floor) | 0.7622 | — | 0.03 s | |
-| 1 | Heuristic v1 (initial parser, all RELATED pairs on) | 0.9208 | +15.86 pp | 3.1 s | |
-| 2 | Heuristic v2 (data-validated related pairs only) | 0.9383 | +17.61 pp | 3.1 s | |
-| 3 | Heuristic v3 (+ `ABD_PEL` regex fix, `OUTSIDE FILMS=False`, ultrasound-breast-screening tag) | 0.9408 | +17.86 pp | 3.0 s | |
-| 4 | Hybrid v1 (heuristic v3 + `gpt-4o-mini` for conf < 0.85), cold cache | 0.9491 | +18.69 pp | 186 s | |
-| 4w | Hybrid v1, warm cache | 0.9482 | +18.60 pp | 1.7 s | |
-| 5 | Hybrid v2 (revised LLM prompt: explicit conservative defaults + edge-case exclusions) | 0.9493 | +18.71 pp | 175 s | within noise of v1 |
-| **6** | **LightGBM classifier (engineered features), 5-fold OOF** | **0.9603** | **+19.81 pp** | **65 s** | **shipped predictor** |
-| 6t | LightGBM, training-set fit on full public split | 0.9809 | — | 65 s | reported for ablation only; not a generalisation estimate |
-| 7a | LightGBM + sentence embedding cosine similarity (Option 3a) | 0.9594 | +19.72 pp | 70 s | no improvement over #6 |
-| 7b | LightGBM + cosine + diff/sum/prod summaries (Option 3b) | 0.9594 | +19.72 pp | 75 s | no improvement |
+| # | Predictor | Accuracy | Δ vs always-False | Wall time |
+| --- | --- | --- | --- | --- |
+| 0 | `always_false` (sanity floor) | 0.7622 | — | 0.03 s |
+| 1 | Heuristic v1 (initial parser, all RELATED pairs on) | 0.9208 | +15.86 pp | 3.1 s |
+| 2 | Heuristic v2 (data-validated related pairs only) | 0.9383 | +17.61 pp | 3.1 s |
+| 3 | Heuristic v3 (`ABD_PEL` regex fix, `OUTSIDE FILMS=False`, ultrasound-breast-screening tag) | 0.9408 | +17.86 pp | 3.0 s |
+| 4 | Heuristic v3.1 (`LEGS` plural, `NMmyo` concat, span-priority suppression, `HEAD AND NECK` literal) | 0.9418 | +17.96 pp | 3.0 s |
+| 5 | Hybrid (heuristic v3 + `gpt-4o-mini` for conf < 0.85), cold cache | 0.9491 | +18.69 pp | 186 s |
+| 5w | Hybrid, warm cache (zero LLM calls) | 0.9482 | +18.60 pp | 1.7 s |
+| 6 | Hybrid + revised LLM prompt (explicit conservative defaults + edge-case exclusions) | 0.9493 | +18.71 pp | 175 s |
+| **7** | **LightGBM classifier (engineered features), 5-fold OOF** | **0.9603** | **+19.81 pp** | **65 s** |
+| 7t | LightGBM, training-set fit on full public split | 0.9798 | — | 65 s |
+| 8a | LightGBM + sentence-embedding cosine similarity | 0.9594 | +19.72 pp | 70 s |
+| 8b | LightGBM + cosine + diff/sum/prod summary stats | 0.9594 | +19.72 pp | 75 s |
+
+Row 7 (the shipped classifier) is reproducible across runs. We discovered
+during development that `hash((curr_desc, prior_desc))` is a randomised
+group identifier (Python's `hash()` uses `PYTHONHASHSEED` by default), so
+the GroupKFold split was unstable across processes. Switching to the
+joined description-pair string and pinning `seed=42` /
+`deterministic=True` / `n_jobs=1` in the LightGBM params produces
+byte-identical fold accuracies (`0.9622, 0.9553, 0.9643, 0.9649, 0.9547`)
+across runs.
 
 ## Confusion matrices
 
-### Heuristic v3
+### Heuristic v3.1 (deployed fallback)
 
-```
+```text
               pred False   pred True
-true False        20480         567
-true True          1069        5498
+true False        20497         550
+true True          1056        5511
 ```
 
-Failure modes are roughly symmetric (567 false-positives vs 1069 false-negatives).
-Remaining errors are dominated by clusters that are intrinsically ambiguous from
-text alone: **echo ↔ chest CT/XR**, **CT angio head ↔ CT angio carotid**,
-**EEG ↔ MRI brain**, **CT-guided FNA**, **bone scan ↔ specific organ studies**.
+Failure modes are roughly symmetric (550 false-positives, 1,056
+false-negatives). Remaining errors are dominated by clusters that are
+intrinsically ambiguous from text alone: echo ↔ chest CT/XR, CT angio
+head ↔ CT angio carotid, EEG ↔ MRI brain, CT-guided FNA, bone scan ↔
+specific organ studies.
 
-### Hybrid v1 (cold cache)
+### LightGBM classifier (5-fold OOF, seeded)
 
-```
+```text
               pred False   pred True
-true False        20533         514
-true True           892        5675
+true False        20659         388
+true True           709        5858
 ```
 
-Compared to heuristic-only, hybrid converts 177 false-negatives → true positives
-and 53 false-positives → true negatives (230 net wins). The LLM helps more on
-the false-negative axis.
+Compared with heuristic v3.1: **+347 TP**, **−162 FP**, **−347 FN**,
+**+162 TN** — both error axes improve. The +509 net correctly
+classified pairs translate to the +1.85 pp improvement over
+heuristic-only.
 
-### LightGBM classifier (5-fold OOF)
+## What we tried — heuristic side
 
-```
-              pred False   pred True
-true False        20649         398
-true True           697        5870
-```
+### Parser-level changes that helped
 
-Compared to hybrid v1: +195 TP, −116 FP, −195 FN, +116 TN. Both error axes
-improve. Total +311 correct predictions on the same data.
+| Change | Public-split evidence | Decision |
+| --- | --- | --- |
+| `bone_scan → wholebody` (covers torso PET/NM scans) | dominates bone-scan TPs | added |
+| `ULTRASOUND BILAT SCREEN → breast` | 107 / 4 | added |
+| `OUTSIDE FILMS → False` | 0 / 67 | added |
+| `bone_density` exclusive (suppresses `hip`/`spine` co-tags) | 41 / 575 cross-pairs | added |
+| Underscore in `ABD_PEL` regex | bug — `\W` excludes `_` in Python | fixed |
+| `\b(LEG\|LEGS\|LE)\b` (catch `BILAT LEGS`) | 213 occurrences, +5 heuristic predictions | fixed |
+| `\bN?M\s*MYO\s*PERF\b` (catch `NMmyo perf`) | 70 occurrences, +3 heuristic predictions | fixed |
+| Span-priority suppression in `parse_description` | bug — `HEAD AND NECK` was tagging as both `neck` AND `brain` | fixed |
+| `\bHEAD\s+AND\s+NECK\b` literal alternation | bug — `\W+` doesn't match the letters in " AND " | fixed |
 
-## Ablations that hurt — region-pair links
+### Cross-region pair ablations — every candidate net-negative
 
-We hypothesised that adding cross-region links to `RELATED_REGION_PAIRS` would
-help. We tested 13 candidate pairs; **all 13 are net-negative** on the public
-split, so none were added. The pattern is consistent: labelers in this dataset
-are judging *clinical utility*, not anatomical overlap, and reject many
-anatomically adjacent pairs as "doesn't help today's read."
+We tested adding cross-region links to `RELATED_REGION_PAIRS`. The pattern
+is consistent: labelers in this dataset are judging *clinical utility*
+(does this prior add value to today's read?), not anatomical overlap.
+Anatomically-adjacent pairs are mostly labeled negative.
 
 | Linkage | Pos / Neg pairs in data | Net | Decision |
 | --- | --- | --- | --- |
@@ -143,226 +220,268 @@ anatomically adjacent pairs as "doesn't help today's read."
 | `c_spine ↔ t_spine` | 23 / 38 | −15 | dropped |
 | `eeg ↔ brain` | 30 / 32 | −2 | dropped (barely) |
 
-This systematic negative result strongly suggests blanket cross-region rules
-are structurally wrong for this dataset. Any future linkages should be
-**modality-conditional** (e.g., "heart ↔ chest only when both are CT/MRI"),
-not region-only.
+Thirteen candidates, all net-negative. Strong evidence that blanket
+cross-region rules don't fit this dataset; any future linkages should be
+**modality-conditional**, not region-only.
 
-## Ablations that helped
+## What we tried — LLM side
 
-### Parser-level (heuristic v3)
+### Hybrid heuristic + `gpt-4o-mini`
 
-| Change | Pos / Neg pairs in data | Decision |
+For pairs with heuristic confidence `< 0.85`, we batched all ambiguous
+priors per case into a single OpenAI call (one HTTP round-trip per case,
+not per pair) with `response_format=json_object` and cached results on
+disk by `(curr_desc, prior_desc)`. Cold-cache pass over the public split:
+1,978 unique ambiguous pairs, ~$0.10–0.20 in API cost, 186 s wall time.
+Warm cache made every repeat run 0 s of LLM cost.
+
+Result: **0.9491 cold / 0.9482 warm** — +0.83 pp over heuristic v3, but
+beneath the LightGBM classifier and at the cost of an external API
+dependency.
+
+### Revised LLM prompt
+
+We rewrote the system prompt to add explicit conservative-default rules
+("when uncertain, predict NOT relevant — labelers are strict") plus
+data-validated edge-case exclusions (spine ↔ chest/abdomen/pelvis,
+carotid ↔ brain, EEG ↔ brain, GI fluoro ↔ chest). Result: 0.9491 →
+**0.9493**, within the cache-race noise floor (~24 predictions). The
+directional shift in the confusion matrix was the right one (more
+conservative — fewer FPs, more TNs) but the magnitude was negligible.
+
+### Decision: drop the LLM tier
+
+Once the LightGBM classifier was in place, the LLM tier became dead code
+in normal operation — it only fired when the model file was missing. We
+deleted `app/llm.py`, `.cache/`, the `openai` dependency, and the LLM
+tier-routing in `classifier.py`. The new fallback is heuristic-only
+(0.9418), which fires only on a deploy where the model file is absent
+or has drifted from the current `features.py`.
+
+Result: smaller image (~10 MB lighter), no external API dependency at
+inference, no silent-failure mode from a misconfigured key.
+
+## What we tried — classifier side
+
+### Engineered-feature LightGBM (Option 2)
+
+121 features per pair across:
+
+- **Region one-hots** for the 20 most-common region tags (curr / prior /
+  both)
+- **Direct + expanded region overlap** indicators (using
+  `COVERAGE_EXPANSIONS`)
+- **Modality** one-hots (CT, MRI, XR, etc.) per side, plus
+  `same_modality` and `both_cross_section`
+- **Contrast match** (with / without / mixed) and **laterality
+  mismatch** (left vs right)
+- **Date delta** in days, log-scaled, and bucketed (`<30d`, `<1y`,
+  `<2y`, `>5y`)
+- **Description-text features**: lengths, length ratio, shared-token
+  count
+- **Heuristic prediction + confidence + reason** (the heuristic's output
+  is itself a feature, so the model can learn when to trust or override
+  it)
+
+Top features by gain:
+
+| Rank | Feature | Notes |
 | --- | --- | --- |
-| `bone_scan → wholebody` (covers torso PET/NM) | dominant on bone-scan TPs | added |
-| `ULTRASOUND BILAT SCREEN → breast` | 107 / 4 | added |
-| `OUTSIDE FILMS → False` | 0 / 67 | added |
-| `bone_density` exclusive (suppresses `hip`/`spine` co-tags) | 41 / 575 cross-pairs | added |
-| Underscore in `ABD_PEL` regex | bug (`\W` excludes `_` in Python) | fixed |
+| 1 | `heur_pred` | Dominant input — the model is essentially "augmented heuristic" |
+| 2 | `expanded_overlap` | Region overlap with coverage expansions |
+| 3 | `date_delta_days` | Signal the heuristic ignored — adds real lift |
+| 4 | `heur_conf` | Heuristic confidence as a second-order signal |
+| 5 | `lateral_mismatch` | Parsed but never used by the heuristic |
+| 6 | `direct_overlap` | Literal region-set intersection |
+| 7 | `shared_tokens` | Token-level text similarity |
+| 8 | `desc_len_ratio` | Description length ratio |
 
-### Cluster A — regex bugs found and fixed
-
-| Fix | Hit count | Heuristic Δ | Hybrid Δ | Decision |
-| --- | --- | --- | --- | --- |
-| `\b(LEG\|LE)\b` → `\b(LEG\|LEGS\|LE)\b` (catch `BILAT LEGS`) | 213 occurrences | +5 | +0 | kept |
-| `\bMYO ?PERF\b` → `\bN?M\s*MYO\s*PERF\b\|...` (catch `NMmyo`) | 70 occurrences | +3 | +9 | kept |
-| Both fixes combined | 283 | +8 | +9 (+0.03 pp) | kept |
-
-Tiny gain but free; both are genuine regex bugs that miss valid variants.
-
-### LLM prompt v2
-
-Replaced the ambiguous `OPEN` rule "*relevant if anatomy substantially overlaps*"
-with a more precise rubric: explicit conservative-default ("when in doubt,
-predict NOT relevant — labelers are strict"), plus data-validated exclusions
-for the highest-volume error clusters (spine ↔ chest/abdomen/pelvis,
-carotid ↔ brain, EEG ↔ brain, GI fluoro ↔ chest, adjacent spine levels).
-
-Result on cold-cache hybrid: 0.9491 → **0.9493** (+6 correct, +0.02 pp).
-Within the cache-race noise floor (~24 predictions), but directionally correct
-— the model became more conservative as intended (−40 TP, −46 FP, +46 TN,
-+40 FN). Kept the v2 prompt because it's strictly better as documentation
-even if the metric impact is small.
-
-### LightGBM classifier (Option 2) — the big win
-
-**Public-split CV: 0.9603 (5-fold GroupKFold).** This is the predictor
-shipped in production.
-
-Top features by gain (last fold):
-
-| Rank | Feature | Gain | What it tells us |
-| --- | --- | --- | --- |
-| 1 | `heur_pred` | 88,060 | The heuristic is the dominant signal — model uses it as the base |
-| 2 | `expanded_overlap` | 48,377 | Region overlap with coverage expansions |
-| 3 | `date_delta_days` | 6,733 | **Dates do help** — first time we used them |
-| 4 | `heur_conf` | 5,679 | Heuristic confidence as a second-order signal |
-| 5 | `lateral_mismatch` | 3,950 | Left↔right detection (parsed but never used by heuristic) |
-| 6 | `direct_overlap` | 3,854 | |
-| 7 | `shared_tokens` | 3,609 | Token-level text similarity |
-| 8 | `desc_len_ratio` | 3,526 | |
-
-Three of the top eight (date deltas, laterality, text-level similarity) are
-signals the heuristic completely ignored. The classifier essentially
-**augments** the heuristic with these missing inputs.
+The classifier essentially **augments** the heuristic with date deltas,
+laterality, and text-level similarity — three signals the heuristic
+doesn't look at. That's where the +1.85 pp jump comes from.
 
 ### Sentence embeddings (Option 3) — no improvement
 
-Tested whether MiniLM-based sentence embeddings could lift the classifier
+We tested whether MiniLM-based embeddings could lift the classifier
 beyond engineered features.
 
 | Variant | Features | OOF acc | Δ vs Option 2 |
 | --- | --- | --- | --- |
-| Option 2 (engineered) | 121 | 0.9595 | — |
+| Option 2 (engineered only) | 121 | 0.9595 | — |
 | Option 3a (+ embedding cosine sim) | 122 | 0.9594 | −0.01 pp |
-| Option 3b (+ cosine + diff/sum/prod summary stats) | 130 | 0.9594 | −0.01 pp |
+| Option 3b (+ cosine + diff/sum/prod summaries) | 130 | 0.9594 | −0.01 pp |
 
-All within noise. Why embeddings don't help here:
+All within noise. Three reasons embeddings don't help here:
 
 - Descriptions are short bureaucratic strings, not natural language.
-- Engineered features already capture the same content (regions, modality,
-  shared tokens).
-- MiniLM is general-purpose and lacks radiology-domain knowledge — our
-  100-line regex parser is at a knowledge advantage on these specific terms.
+- Engineered features already capture the same content (regions,
+  modality, shared tokens).
+- MiniLM is general-purpose and lacks radiology-domain knowledge — the
+  100-line regex parser is at a knowledge advantage on these specific
+  terms.
 
-Removed the `sentence-transformers` / `torch` deps after this measurement.
-A *medical-domain* embedding (BioBERT, ClinicalBERT, RadBERT) might do better,
-but that's a much bigger commitment for an unclear gain.
+The `sentence-transformers` / `torch` dependencies were uninstalled
+after this measurement. A *medical-domain* embedding (BioBERT,
+ClinicalBERT, RadBERT) might do better, but the dependency cost
+(~1 GB image growth) wasn't justified by the data.
+
+## Test coverage
+
+The codebase has two test files:
+
+- `tests/test_contract.py` (3 tests) — feeds the example payload from
+  the challenge brief through the FastAPI endpoint and verifies request
+  / response shapes match the spec, including all paths (`/predict`,
+  `/`, `/healthz`).
+- `tests/test_parser.py` (27 tests) — pins parser and heuristic edge
+  cases:
+  - `ABD_PEL` underscore / slash / space forms
+  - `OUTSIDE FILMS` flag handling and the "OUTSIDE SCREENING US BREAST
+    BILATERAL" exception (which is *not* an outside-films pattern)
+  - `HEAD AND NECK` priority over bare `HEAD`
+  - Exclusive tags: `bone_density` and `eeg` overriding co-tags
+  - Laterality (left / right / bilateral), modality detection (CT, MRI
+    not MRA, CTA precedence), contrast (`with_without`)
+  - Cross-region exclusions: `vasc_carotid ↮ brain`, `eeg ↮ brain MRI`,
+    `heart ↮ chest`, `t_spine ↮ chest`, `l_spine ↮ abdomen`
+  - Coverage overlaps that *do* fire: `abd_pel ↔ abdomen`,
+    `wholebody ↔ chest`
+  - `classify_pair` confidence + reason wiring per branch
+
+Total: 30 tests, run in ~0.3 s. All decisions called out in this
+document have a corresponding test that would fail if the rule were
+silently regressed.
 
 ## Cost & latency
 
 | Predictor | Wall time on full public split | API cost | External deps |
 | --- | --- | --- | --- |
 | Heuristic only | 3 s | $0 | none |
-| Hybrid v1 (cold) | 186 s | ~$0.10–0.20 | OpenAI |
-| Hybrid v1 (warm cache) | 1.7 s | $0 | OpenAI (key still required to handle unseen pairs) |
+| Hybrid (cold cache, deprecated) | 186 s | ~$0.10–0.20 | OpenAI |
+| Hybrid (warm cache, deprecated) | 1.7 s | $0 | OpenAI |
 | **LightGBM classifier (deployed)** | **65 s** | **$0** | **none — model packaged in image** |
 
-Per-pair: ~2.4 ms for the classifier. Worst-case private-split case (234
-priors) → ~0.6 s for that one case. A request with 100 such cases → ~1 min,
-comfortably inside the 360 s evaluator budget.
+Per-pair: ~2.4 ms for the classifier. Worst-case private-split case
+(234 priors) → ~0.6 s for that one case. A request with 100 such cases
+→ ~1 min, comfortably inside the 360 s evaluator budget.
 
-The heuristic + LLM hybrid is retained as a fallback path. If the
-`classifier_model.pkl` is missing on a deploy, the system silently degrades
-to hybrid (or further to heuristic-only if `OPENAI_API_KEY` is unset). All
-three failure paths return well-formed predictions; none can produce a 5xx
-or a skip.
+If `classifier_model.pkl` is missing on a deploy, or the saved model's
+feature schema doesn't match `app/features.py` (drift check at load
+time), the system silently degrades to **heuristic-only** (0.9418).
+The all-False fallback at the FastAPI layer is the ultimate floor
+(0.7622). All three return well-formed predictions; none can produce a
+5xx or a skip.
 
-## Known issues
+## Reproducibility
 
-- **Cache writer race in the LLM tier.** When the same `(curr, prior)` pair
-  appears in multiple cases that run concurrently, both LLM calls fire before
-  either writes the cache, and the last writer wins. Combined with mild
-  non-determinism in OpenAI at `temperature=0.0`, repeat warm-cache hybrid
-  runs can disagree on ~24 / 27,614 (≈ 0.09 %) pairs. Not relevant in normal
-  operation now that the classifier is the primary tier; left in place because
-  the LLM is fallback-only.
-- **`OPENAI_API_KEY` failure modes are silent at the request level.** During
-  development we hit a 401 from a revoked key and the system silently fell
-  through to heuristic. Worth adding a startup-time `models.list()` smoke
-  check that surfaces the failure loudly. Less urgent now that the
-  classifier doesn't need the LLM.
-- **LightGBM has small non-determinism** from `bagging_fraction` /
-  `feature_fraction` sampling without a fixed seed. Two training runs of the
-  same script can land in 0.9595–0.9605 range. Add `seed=42` to the params
-  for fully reproducible experiments.
+The training pipeline is fully deterministic:
 
-## Next steps and methodologies worth trying
+- `eval/train_classifier.py` uses the joined description-pair string
+  (not Python's `hash()`) as the GroupKFold group identifier, so folds
+  are stable across processes.
+- LightGBM is trained with `seed=42`, `feature_fraction_seed=42`,
+  `bagging_seed=42`, `data_random_seed=42`, `deterministic=True`, and
+  `n_jobs=1`. Two consecutive runs produce byte-identical fold
+  accuracies and OOF totals.
+- `app/classifier_model.py` validates the saved model's
+  `feature_names` against the live `feature_names()` from
+  `app/features.py` at load time. On mismatch, the classifier tier
+  disables itself loudly and the system falls through to heuristic —
+  preventing silent garbage from a feature-schema drift.
+- Reproduction: `python -m eval.train_classifier` prints fold and OOF
+  numbers; `python -m eval.train_classifier --save` rebuilds the
+  pickle.
 
-Ranked by my honest read of expected gain × effort. The deployed classifier
-is at 0.9603 OOF; 0.97+ probably requires multiple of these to compose.
+## Next steps
 
-### Quick wins (a few hours of work each)
+Ranked by my read of expected gain × effort. The deployed classifier is
+at 0.9603 OOF on the public split.
 
-1. **Hand-curate a "tricky pairs" lookup table.** The remaining ~1,100 errors
-   come from <50 description-pair clusters (e.g., echo↔chest CT, CT-angio
-   variants, bone scan↔specific organ). One round of hand-labeling those and
-   bypassing both classifier and LLM for them would tighten accuracy at zero
-   runtime cost. Expected: +0.3 to +0.7 pp.
+### Quick wins (a few hours each)
 
-2. **Probability calibration + threshold sweep.** The classifier's threshold
-   is fixed at 0.5 but the OOF sweep showed 0.40 nudges accuracy slightly
-   higher (0.9606). Worth a proper validation-set sweep once private-split
-   labels are available. Expected: +0.05 pp.
-
-3. **Bigram / trigram token features.** Add character n-gram cosine similarity
-   between descriptions to the feature matrix. Captures sub-word similarity
-   the regex parser misses (e.g., "LIMITED" vs "LMTD"). Expected: +0.1 pp.
-
-4. **Modality-conditional cross-region rules.** The 13 dropped blanket links
-   were structurally wrong, but some likely survive when conditioned on
-   modality. Test "heart ↔ chest under CT/MRI", "carotid ↔ brain under MRA",
-   etc., and add them as features. Expected: +0.1 to +0.3 pp.
-
-5. **Patient-level features from `patient_name` / `patient_id`.** Currently
-   ignored. Could surface signal like "this patient has a long-term cancer
-   workup, so PET priors are more relevant." Expected: depends entirely on
-   whether the IDs encode anything useful — start with a sniff test.
+1. **Hand-curate a "tricky pairs" lookup table.** The remaining ~1,100
+   errors come from <50 description-pair clusters. One round of
+   hand-labeling those and bypassing the classifier for them would
+   tighten accuracy at zero runtime cost. Expected: +0.3 to +0.7 pp.
+2. **Probability calibration + threshold sweep.** The classifier's
+   threshold is fixed at 0.5 but the OOF sweep showed 0.40 nudges
+   accuracy slightly higher (0.9606). Worth a proper sweep with
+   stratified validation. Expected: +0.05 pp.
+3. **Bigram / trigram token features.** Add character n-gram cosine
+   similarity between descriptions to the feature matrix. Captures
+   sub-word similarity the regex parser misses (e.g. "LIMITED" vs
+   "LMTD"). Expected: +0.1 pp.
+4. **Modality-conditional cross-region rules.** The 13 dropped blanket
+   links were structurally wrong, but some likely survive when
+   conditioned on modality. Test "heart ↔ chest under CT/MRI",
+   "carotid ↔ brain under MRA", etc., and add them as features.
+   Expected: +0.1 to +0.3 pp.
+5. **Patient-level features.** `patient_name` / `patient_id` are
+   currently ignored. Could surface signal like "this patient has a
+   long-term cancer workup, so PET priors are more relevant." Start
+   with a sniff test on the public split.
 
 ### Larger investments (a day or more)
 
-1. **Fine-tune a small encoder (DistilBERT / MiniLM) on labeled pairs.**
-   Treat each `(curr, prior)` pair as a sentence-pair classification task,
-   fine-tune for 2–3 epochs. Cross-encoder architecture with a binary head
-   on top of `[CLS]`. Public-split has 27 k labeled pairs — enough for a
-   small model. Expected: +0.3 to +0.7 pp if executed well, but adds a
-   significant model + tokenizer dependency to the Docker image. Could be
-   an alternative tier 1 (with the LightGBM as fallback) or used as a
-   stacked feature into LightGBM.
+1. **Fine-tune a small encoder** (DistilBERT / MiniLM) on labeled pairs
+   as a sentence-pair binary classifier. 27 k labeled pairs is enough
+   for a small cross-encoder; could be tier 1 or a stacked feature into
+   LightGBM. Expected: +0.3 to +0.7 pp; cost: ~200 MB image growth.
+2. **Domain-specific embeddings** (BioBERT, ClinicalBERT, BioLinkBERT).
+   These were trained on PubMed / clinical notes and should know
+   radiology synonyms our regex parser doesn't. Re-test the
+   cosine-summary experiment with one of them. Expected: +0.2 to
+   +0.5 pp; cost: ~1 GB image growth.
+3. **Self-consistency on borderline pairs.** For pairs where the
+   classifier's `proba ∈ [0.4, 0.6]`, fan out to N=3 calls with
+   different prompts / models, take majority vote. Expected: +0.2 to
+   +0.4 pp.
+4. **Active-learning loop.** Use the classifier's OOF probability to
+   surface the highest-uncertainty pairs from the public split,
+   hand-label them precisely, retrain. Iterate 2–3 rounds. Expected:
+   +0.3 to +0.5 pp.
+5. **Stacked ensemble.** Train a second classifier with different
+   hyperparameters or feature cuts, combine via meta-learner.
+   Expected: +0.05 to +0.15 pp.
 
-2. **Domain-specific embeddings.** Replace MiniLM with BioBERT,
-   ClinicalBERT, or BioLinkBERT and re-test the cosine + summary-features
-   experiment. These models were trained on PubMed / clinical notes and
-   should know that "MAM US BI breast screening" and "MG tomo screening
-   bilateral" are clinical synonyms. If even one of these moves the OOF
-   number up by 0.1+ pp, the embedding feature is worth the dependency.
-   Expected: +0.2 to +0.5 pp; size cost ~1 GB.
+### Radiologist-centred validation
 
-3. **Self-consistency / ensembling on borderline pairs.** For pairs where
-   the classifier reports `proba ∈ [0.4, 0.6]` (genuinely uncertain), fan
-   out to N=3 calls of `gpt-4o-mini` with different temperatures, take
-   majority vote. Combine with the classifier prediction via stacked
-   logistic regression. Adds latency for ~5 % of pairs but only on those
-   the classifier is unsure about. Expected: +0.2 to +0.4 pp.
+The data-driven nature of all tuning above means our exclusions and
+inclusions reflect *what the labelers in this dataset chose*, not
+necessarily *what a working radiologist would prefer for their actual
+workflow*. To validate the model in a clinical setting:
 
-4. **Active-learning loop.** Use the classifier's OOF probability to surface
-   the highest-uncertainty pairs from the public split, hand-label them
-   precisely, retrain. Iterate 2–3 rounds. Lifts accuracy on the same
-   description-pair clusters that are currently borderline. Expected:
-   +0.3 to +0.5 pp; significant manual effort.
+1. **Top-cluster review.** Pull the 30 highest-volume description-pair
+   clusters where the classifier and the labels disagree (in either
+   direction). Examples expected: echo↔chest CT, CT-angio
+   head↔CT-angio carotid, EEG↔brain MRI, l_spine↔abdomen,
+   bone-scan↔organ-specific.
+2. **Blind clinician audit.** Present each cluster's description pair
+   to 2–3 staff radiologists as: "If you were reading [current], would
+   you want to see [prior]? Yes / No / It depends — explain." No
+   labels shown.
+3. **Disagreement triage.** For pairs where clinicians split or
+   disagree with both the model and the labels, flag as
+   intrinsically ambiguous; consider returning a calibrated probability
+   rather than a hard bool.
+4. **Workflow-aware features.** Talk to clinicians about features the
+   parser ignores: sub-specialty (cardiac vs general), shift context,
+   patient age cohort. Some are inferable from the description; others
+   would require expanding the request schema.
+5. **Calibration over time.** In a real RIS deployment, log the model's
+   probability, the radiologist's chosen action, and whether the prior
+   was actually opened. This lets us measure "did the prior add value
+   when shown" rather than only "was the bool correct."
 
-5. **Stacked ensemble.** Train a second classifier (e.g., XGBoost with
-   different hyperparams, or a logistic regression on a different feature
-   cut) and combine via meta-learner. Modest gain on tabular tasks
-   historically. Expected: +0.05 to +0.15 pp.
+### Things I'd specifically *not* try
 
-### Architectural changes worth considering
-
-1. **Replace the LLM tier entirely** by removing `app/llm.py` and the OpenAI
-   dependency from the Docker image. The classifier doesn't need it. This is
-   a code-cleanup win, not an accuracy win — but reduces failure surface,
-   image size, and submission-package complexity. Worth doing once the
-   classifier path is fully validated against the private split.
-
-2. **Per-modality model partitioning.** Train separate LightGBM models for
-   `(CT, CT)`, `(MRI, MRI)`, `(XR, XR)`, etc. Each model focuses on its
-   modality's failure patterns. Routing logic at inference. Probably
-   overkill for 27 k examples but worth thinking about if data grows.
-
-3. **Calibrated cost-sensitive training.** Right now we treat false-positives
-   and false-negatives equally because the metric is symmetric accuracy. If
-   the scoring ever changes to reward precision or recall asymmetrically,
-   LightGBM's `is_unbalance` / `scale_pos_weight` parameters give us a
-   direct knob.
-
-### What I'd specifically *not* recommend
-
-- **Larger LLM (`gpt-4o`, `gpt-5`).** Hybrid v1 → hybrid v2 (prompt change)
-  was already within noise. The bottleneck isn't the model's reasoning, it's
-  the inherent label ambiguity in short text.
-- **General-purpose sentence embeddings on top of engineered features.**
-  Already tested in Option 3a/3b — flat result.
-- **More heuristic rules from domain intuition.** 13/13 ablations
-  net-negative; the dataset structurally rejects this approach.
-- **Reasoning-mode LLMs (`o1-mini`, `o3-mini`).** Per-pair latency would blow
-  the 360 s budget on the worst-case 234-prior case.
+- **Larger general-purpose LLMs** (`gpt-4o`, `gpt-5`). The hybrid prompt
+  rewrite was within noise; the bottleneck isn't model reasoning, it's
+  inherent label ambiguity in short text.
+- **General-purpose sentence embeddings** on top of engineered features
+  — already tested in Option 3a/3b, flat result.
+- **More heuristic rules from domain intuition.** 13/13 cross-region
+  ablations were net-negative; the dataset structurally rejects this
+  approach.
+- **Reasoning-mode LLMs** (`o1-mini`, `o3-mini`). Per-pair latency would
+  blow the 360 s budget on the worst-case 234-prior case.

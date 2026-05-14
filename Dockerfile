@@ -12,11 +12,6 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY app/ ./app/
-# Optional: prebuilt LLM cache shipped with the image so cold starts are fast.
-# Safe to omit if .cache/ does not exist locally.
-COPY .cach[e]/ ./.cache/
-
-ENV CACHE_PATH=/app/.cache/llm_cache.json
 
 # Hugging Face Spaces sends traffic to $PORT (defaults to 7860).
 EXPOSE 7860

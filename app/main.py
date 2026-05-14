@@ -24,7 +24,7 @@ except Exception:
     pass
 
 from app.classifier import predict_cases_async
-from app.llm import get_cache, llm_enabled
+from app.classifier_model import is_available as classifier_available
 from app.schemas import PredictRequest, PredictResponse
 
 logging.basicConfig(
@@ -36,16 +36,8 @@ logger = logging.getLogger("relevant-priors")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cache = get_cache()
-    logger.info(
-        "startup llm_enabled=%s cache_entries=%d model=%s",
-        llm_enabled(), len(cache), os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-    )
+    logger.info("startup classifier_available=%s", classifier_available())
     yield
-    try:
-        get_cache().flush()
-    except Exception as e:
-        logger.warning("cache flush on shutdown failed: %s", e)
 
 
 app = FastAPI(title="Relevant Priors Classifier", version="1.0.0", lifespan=lifespan)
@@ -53,7 +45,7 @@ app = FastAPI(title="Relevant Priors Classifier", version="1.0.0", lifespan=life
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "llm_enabled": llm_enabled(), "cache_entries": len(get_cache())}
+    return {"status": "ok", "classifier_available": classifier_available()}
 
 
 @app.get("/")
@@ -81,8 +73,8 @@ async def _handle(req: PredictRequest, request_id: str) -> PredictResponse:
     n_priors = sum(len(c.prior_studies) for c in req.cases)
     t0 = time.perf_counter()
     # Hard wall-clock budget: keep us inside the evaluator's 360s timeout even
-    # if the LLM tier stalls. On expiry, in-flight tasks are cancelled and we
-    # fall back to all-False for the entire request.
+    # if something stalls. On expiry, in-flight tasks are cancelled and we fall
+    # back to all-False for the entire request.
     budget_s = float(os.environ.get("REQUEST_TIMEOUT_S", "300"))
     try:
         predictions = await asyncio.wait_for(

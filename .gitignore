@@ -6,14 +6,16 @@ venv/
 .env
 .env.*
 !.env.example
-.cache/*
-!.cache/llm_cache.json
+.cache/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 *.pkl
 !app/classifier_model.pkl
 .DS_Store
+
+# Build artefacts (regenerable via `git archive`)
+submission.zip
 
 # Project-private Claude Code guidance — not part of the submission
 CLAUDE.md

@@ -22,8 +22,10 @@ def _norm(s: str) -> str:
 # Order matters where prefixes overlap; longer/more-specific entries first.
 REGION_PATTERNS: list[tuple[str, str]] = [
     # "HEAD AND NECK" / "HEAD/NECK" — almost always soft-tissue neck, not brain.
-    # Must come before the bare HEAD pattern.
-    (r"\bHEAD\W+NECK\b|\bH/N\b|\bHEAD/NECK\b", "neck"),
+    # Must come before the bare HEAD pattern. Note: \W+ alone wouldn't catch
+    # the literal " AND " separator (A/N/D are word chars), so we match it
+    # explicitly.
+    (r"\bHEAD\s+AND\s+NECK\b|\bHEAD\W+NECK\b|\bH/N\b|\bHEAD/NECK\b", "neck"),
     # Bone scan / whole-body NM imaging
     (r"\bBONE SCAN\b|\bSKELETAL SURVEY\b", "wholebody"),
     # Ultrasound breast screening variants that don't say "breast" or "mam"
@@ -199,8 +201,15 @@ def parse_description(description: str) -> StudyTags:
     matched_spans: list[tuple[int, int]] = []
     for pat, tag in REGION_PATTERNS:
         for m in re.finditer(pat, s):
+            span = (m.start(), m.end())
+            # Honour the priority-by-order contract: skip this match if it
+            # overlaps a span already claimed by a higher-priority pattern.
+            # Without this, "HEAD AND NECK" tags as both 'neck' (correct) AND
+            # 'brain' (the bare HEAD pattern firing inside the same span).
+            if any(span[0] < pe and ps < span[1] for ps, pe in matched_spans):
+                continue
             regions.add(tag)
-            matched_spans.append((m.start(), m.end()))
+            matched_spans.append(span)
 
     # Apply exclusive-tag override
     exclusive_present = regions & EXCLUSIVE_REGION_TAGS

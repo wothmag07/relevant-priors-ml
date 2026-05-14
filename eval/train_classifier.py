@@ -73,7 +73,10 @@ def build_matrix(rows):
     return X, y, names
 
 
-def train_one(X_train, y_train, params=None):
+DEFAULT_SEED = 42
+
+
+def train_one(X_train, y_train, params=None, seed: int = DEFAULT_SEED):
     p = {
         "objective": "binary",
         "metric": "binary_logloss",
@@ -84,7 +87,13 @@ def train_one(X_train, y_train, params=None):
         "bagging_fraction": 0.9,
         "bagging_freq": 5,
         "verbose": -1,
-        "n_jobs": -1,
+        "n_jobs": 1,                # avoid the small non-determinism histogram-build
+                                    # has at high thread counts
+        "seed": seed,
+        "feature_fraction_seed": seed,
+        "bagging_seed": seed,
+        "data_random_seed": seed,
+        "deterministic": True,
     }
     if params:
         p.update(params)
@@ -113,8 +122,11 @@ def main():
     X, y, names = build_matrix(rows)
     print(f"  X shape: {X.shape}  ({time.perf_counter() - t0:.1f}s)")
 
-    # Group by unique (curr_desc, prior_desc) tuple — same text-pair never spans folds.
-    groups = np.array([hash((r["curr_desc"], r["prior_desc"])) for r in rows])
+    # Group by unique (curr_desc, prior_desc) tuple — same text-pair never spans
+    # folds. NOTE: Python's built-in hash() is randomized per process
+    # (PYTHONHASHSEED), so it is NOT a stable group identifier across runs. Use
+    # the joined string itself; sklearn accepts arrays of arbitrary hashables.
+    groups = np.array([f"{r['curr_desc']}||{r['prior_desc']}" for r in rows])
     n_groups = len(set(groups))
     print(f"  unique (curr,prior) text-pair groups: {n_groups}")
 

@@ -28,21 +28,22 @@ Request and response shapes match the challenge brief verbatim — see
 `app/schemas.py`.
 
 `POST /` is also accepted (some evaluators target the root path). `GET /healthz`
-returns liveness + LLM-enabled status.
+returns liveness + classifier-availability status.
 
 ## Approach
 
-Three layered tiers. The first to succeed wins.
+Two layered tiers — no external API at inference time.
 
 1. **LightGBM classifier** (`app/classifier_model.py`, `app/features.py`) —
    primary path. Trained offline on the public split with ~120 engineered
    features per pair: region one-hots, modality, contrast, laterality, date
    deltas, description-text features, and the heuristic's own prediction +
-   confidence as inputs. Deterministic, ~2 ms/pair, no API dependency.
-2. **Heuristic + LLM hybrid** — fallback if the LightGBM model file is missing
-   on a deploy. `app/parser.py` tags each `study_description` with anatomical
-   regions + modality + contrast/laterality; `app/heuristic.py` does region-set
-   overlap; pairs with confidence `< 0.85` are batched to `gpt-4o-mini`.
+   confidence as inputs. Deterministic, ~2 ms/pair, packaged in the image.
+2. **Heuristic-only fallback** — fires if `classifier_model.pkl` is missing
+   on a deploy or if a feature-schema-drift check at load time refuses the
+   model. `app/parser.py` tags each `study_description` with anatomical
+   regions + modality + contrast/laterality; `app/heuristic.py` does
+   region-set overlap with confidence scoring.
 3. **All-False fallback** — handled at the FastAPI layer in `app/main.py`. If
    both tiers above fail or the request exceeds a 300 s wall-clock budget,
    one all-False prediction per prior is returned (76 % baseline). No
@@ -52,9 +53,9 @@ Public-split accuracy:
 
 | Predictor | Accuracy | Notes |
 | --- | --- | --- |
-| Heuristic only | 0.9408 | regex parser + region overlap, no API |
-| Hybrid (heuristic + `gpt-4o-mini`) | 0.9491 | previous architecture |
-| **LightGBM classifier (5-fold OOF CV)** | **0.9603** | shipped predictor — honest out-of-sample estimate |
+| Heuristic only | 0.9418 | regex parser + region overlap, no API |
+| **LightGBM classifier (5-fold OOF CV)** | **0.9603** | shipped predictor — honest out-of-sample estimate, deterministic with `seed=42` |
+| LightGBM (held-out private-split eval) | 0.9361 | reviewer evaluation result on the hidden split |
 
 See `experiments.md` for the full experiment table, ablations, embeddings
 comparison, and forward-looking methodology suggestions.
@@ -102,25 +103,24 @@ app/main.py::_handle      ← wraps in 300 s wall-clock budget (asyncio.wait_for
 app/classifier.py::predict_cases_async
         │
         ▼
-┌──────────────────────────┐
-│ Tier 1: LightGBM         │ ← fires if app/classifier_model.pkl exists
-│   _predict_via_classifier│   (the production path)
-│   → featurize each pair  │
-│   → model.predict(X)     │
-│   → bool[i] = p[i] >= 0.5│
-└──────────┬───────────────┘
-           │ model missing? ↓
-┌──────────▼───────────────┐
-│ Tier 2: heuristic + LLM  │ ← defensive fallback
-│   parser → heuristic     │
-│   conf < 0.85 → gpt-4o-mini (one batched call per case)
-│   results cached on disk │
-└──────────┬───────────────┘
+┌──────────────────────────────────┐
+│ Tier 1: LightGBM                 │ ← fires if classifier_model.pkl is present
+│   _predict_via_classifier        │   AND its feature schema matches features.py
+│   → featurize each pair          │   (the production path)
+│   → model.predict(X)             │
+│   → bool[i] = proba[i] >= 0.5    │
+└──────────┬───────────────────────┘
+           │ model missing or schema drift? ↓
+┌──────────▼───────────────────────┐
+│ Tier 2: heuristic only           │ ← defensive fallback
+│   parser → classify_pair()       │   (no API, fully self-contained)
+│   → bool from HeuristicResult    │
+└──────────┬───────────────────────┘
            │ tier 2 raises or budget expires? ↓
-┌──────────▼───────────────┐
-│ Tier 3: all-False        │ ← ultimate safety net at FastAPI layer
-│   one False per prior    │   (returns 76 % baseline, never skips)
-└──────────────────────────┘
+┌──────────▼───────────────────────┐
+│ Tier 3: all-False                │ ← ultimate safety net at FastAPI layer
+│   one False per prior            │   (returns 76 % baseline, never skips)
+└──────────────────────────────────┘
         │
         ▼
 HTTP 200 {predictions: [{case_id, study_id, predicted_is_relevant}, ...]}
@@ -136,7 +136,7 @@ HTTP 200 {predictions: [{case_id, study_id, predicted_is_relevant}, ...]}
 | [`eval/train_classifier.py`](eval/train_classifier.py) | Build X/y, GroupKFold CV, train final, save pickle | ✓ | — |
 | `app/classifier_model.pkl` | Pickled `{model, feature_names, threshold}` | output | input |
 | [`app/classifier_model.py`](app/classifier_model.py) | Lazy-load pickle; `predict_batch(pairs) → list[bool]` | — | ✓ |
-| [`app/classifier.py`](app/classifier.py) | Tier-routing across the three layers above | — | ✓ |
+| [`app/classifier.py`](app/classifier.py) | Tier-routing: classifier → heuristic | — | ✓ |
 | [`app/main.py`](app/main.py) | FastAPI endpoint + 300 s wall-clock budget | — | ✓ |
 
 ### What "the model" actually is
@@ -162,7 +162,7 @@ Top features by gain (training the final model on the full public split):
 
 The classifier essentially **augments** the heuristic with date deltas,
 laterality, and text-level similarity — three signals the heuristic doesn't
-look at. That's where the +1.95 pp jump from heuristic (0.9408) to classifier
+look at. That's where the +1.85 pp jump from heuristic (0.9418) to classifier
 OOF (0.9603) comes from.
 
 ## Local development
@@ -173,13 +173,11 @@ uv venv --python 3.11
 source .venv/Scripts/activate          # Windows; on macOS/Linux: source .venv/bin/activate
 uv pip install -r requirements.txt
 
-cp .env.example .env                   # OPENAI_API_KEY only needed for hybrid fallback path
-
-pytest tests/ -q                       # contract tests (no API key needed)
-python -m eval.run_eval --predictor classifier   # primary path, ~65 s on full public split
+pytest tests/ -q                                 # contract + parser unit tests
+python -m eval.run_eval                          # scores the classifier (~65 s)
 python -m eval.run_eval --predictor heuristic    # heuristic-only baseline
-LLM_ENABLED=1 python -m eval.run_eval --predictor hybrid   # heuristic + LLM fallback path
-python -m eval.train_classifier --save           # retrain classifier and save to app/classifier_model.pkl
+python -m eval.train_classifier                  # 5-fold CV (deterministic with seed=42)
+python -m eval.train_classifier --save           # retrain on full data, save app/classifier_model.pkl
 
 uvicorn app.main:app --reload                    # dev server on :8000
 ```
@@ -189,10 +187,9 @@ uvicorn app.main:app --reload                    # dev server on :8000
 1. Create a new Space → SDK = Docker.
 2. Push this repo. The Dockerfile builds a Python 3.11 image, installs
    `requirements.txt`, and copies `app/` (including the trained
-   `classifier_model.pkl`) and any pre-warmed `.cache/` directory.
-3. Set `OPENAI_API_KEY` as a Space secret only if you want the LLM fallback
-   path active. The classifier tier is the primary path and needs no secret.
-4. The `app_port: 7860` in the metadata tells HF where to send traffic.
+   `classifier_model.pkl`).
+3. The `app_port: 7860` in the metadata tells HF where to send traffic.
+4. No secrets required — the inference path is fully self-contained.
 
 ## Environment variables
 
@@ -200,10 +197,5 @@ uvicorn app.main:app --reload                    # dev server on :8000
 | --- | --- | --- |
 | `CLASSIFIER_MODEL_PATH` | `app/classifier_model.pkl` | Override path to the trained LightGBM model. |
 | `CLASSIFIER_THRESHOLD` | `0.5` (or value baked into the pkl) | Probability threshold for the classifier. |
-| `OPENAI_API_KEY` | (unset) | Only needed for the LLM fallback tier. |
-| `OPENAI_MODEL` | `gpt-4o-mini` | Any chat model that supports `response_format=json_object`. |
-| `LLM_ENABLED` | `1` | Set to `0` to force the heuristic to run alone in the fallback tier. |
-| `LLM_MAX_CONCURRENCY` | `8` | Cap concurrent OpenAI calls per request (fallback tier). |
-| `LLM_TIMEOUT_S` | `60` | Per-call timeout for OpenAI requests. |
-| `REQUEST_TIMEOUT_S` | `300` | Hard wall-clock budget per `/predict` request. On expiry, in-flight tasks are cancelled and the all-False fallback fires. |
-| `CACHE_PATH` | `.cache/llm_cache.json` | Disk-backed LLM cache (fallback tier). |
+| `REQUEST_TIMEOUT_S` | `300` | Hard wall-clock budget per `/predict` request. On expiry, in-flight tasks are cancelled and the all-False fallback fires (well inside the evaluator's 360 s timeout). |
+| `LOG_LEVEL` | `INFO` | Standard Python logging level. |

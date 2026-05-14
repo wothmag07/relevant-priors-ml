@@ -1,14 +1,13 @@
 """Score a predictor against the public eval JSON.
 
 Usage:
-    python -m eval.run_eval                       # scores heuristic
-    python -m eval.run_eval --predictor hybrid    # scores hybrid (uses LLM for ambiguous)
-    python -m eval.run_eval --predictor llm_only  # full LLM (slow, expensive)
-    python -m eval.run_eval --limit 100           # first 100 cases only
+    python -m eval.run_eval                            # scores classifier (default)
+    python -m eval.run_eval --predictor heuristic      # heuristic-only baseline
+    python -m eval.run_eval --predictor always_false   # 76 % sanity floor
+    python -m eval.run_eval --limit 100                # first 100 cases only
 
 The harness accepts any callable that takes a list[Case] and returns list[Prediction]
-in the same order/shape as the API contract. This way the same code paths used in
-production are what we measure.
+in the same order/shape as the API contract, so production accuracy = local accuracy.
 """
 from __future__ import annotations
 
@@ -139,13 +138,6 @@ def make_predictor(name: str) -> Callable[[list[Case]], list[Prediction]]:
             ]
         return heuristic
 
-    if name == "hybrid":
-        from app.classifier import predict_cases as _pc
-
-        def hybrid(cases: list[Case]) -> list[Prediction]:
-            return _pc(cases)
-        return hybrid
-
     if name == "classifier":
         from app.classifier_model import predict_batch, is_available
         from app.parser import parse_description
@@ -181,7 +173,8 @@ def make_predictor(name: str) -> Callable[[list[Case]], list[Prediction]]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--predictor", default="heuristic", choices=["always_false", "heuristic", "hybrid", "classifier"])
+    ap.add_argument("--predictor", default="classifier",
+                    choices=["always_false", "heuristic", "classifier"])
     ap.add_argument("--json", default=str(DEFAULT_JSON))
     ap.add_argument("--limit", type=int, default=0, help="if >0, only score the first N cases")
     ap.add_argument("--errors", type=int, default=25)

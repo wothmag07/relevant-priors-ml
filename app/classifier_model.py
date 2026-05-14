@@ -44,10 +44,38 @@ def _load_once() -> bool:
         try:
             with path.open("rb") as f:
                 payload = pickle.load(f)
+            saved_names = list(payload["feature_names"])
+
+            # Guard against silent feature-schema drift: if app/features.py has
+            # been edited since the model was trained (features added, removed,
+            # renamed, or reordered), the saved model would receive misaligned
+            # inputs and produce garbage. Disable the classifier tier loudly
+            # rather than failing silently — the caller falls back to the
+            # heuristic+LLM path which handles this gracefully.
+            from app.features import feature_names as _live_feature_names
+            live_names = _live_feature_names()
+            if saved_names != live_names:
+                logger.error(
+                    "feature schema drift detected: saved model expects %d "
+                    "features, current featurize() produces %d. "
+                    "First mismatch at index %d: saved=%r vs current=%r. "
+                    "Classifier tier disabled — retrain via "
+                    "`python -m eval.train_classifier --save`.",
+                    len(saved_names), len(live_names),
+                    next((i for i, (a, b) in enumerate(zip(saved_names, live_names)) if a != b), -1),
+                    saved_names[: len(live_names)],
+                    live_names[: len(saved_names)],
+                )
+                _loaded = True
+                return False
+
             _model = payload["model"]
-            _feature_names = payload["feature_names"]
+            _feature_names = saved_names
             _threshold = float(os.environ.get("CLASSIFIER_THRESHOLD", payload.get("threshold", 0.5)))
-            logger.info("classifier model loaded: %d features, threshold=%.2f", len(_feature_names), _threshold)
+            logger.info(
+                "classifier model loaded: %d features, threshold=%.2f",
+                len(_feature_names), _threshold,
+            )
         except Exception as e:
             logger.warning("failed to load classifier model from %s: %s", path, e)
             _model = None
