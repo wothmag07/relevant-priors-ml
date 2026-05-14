@@ -24,12 +24,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import numpy as np  # noqa: E402
 import lightgbm as lgb  # noqa: E402
+import numpy as np  # noqa: E402
 from sklearn.metrics import average_precision_score, roc_auc_score  # noqa: E402
 from sklearn.model_selection import GroupKFold  # noqa: E402
 
-from app.features import featurize, feature_names  # noqa: E402
+from app.features import feature_names, featurize  # noqa: E402
 
 DEFAULT_JSON = ROOT / "relevant_priors_public.json"
 DEFAULT_MODEL_PATH = ROOT / "app" / "classifier_model.pkl"
@@ -149,8 +149,8 @@ def main():
     correct = (pred == y).sum()
     total = len(y)
     acc = correct / total
-    confusion = Counter()
-    for t, p in zip(y, pred):
+    confusion: Counter = Counter()
+    for t, p in zip(y, pred, strict=True):
         confusion[(bool(t), bool(p))] += 1
 
     roc_auc = roc_auc_score(y, oof_proba)
@@ -178,13 +178,13 @@ def main():
 
     # Top features by gain
     print("\n=== Top 20 features by gain (last fold) ===")
-    importance = sorted(zip(names, model.feature_importance(importance_type="gain")),
+    importance = sorted(zip(names, model.feature_importance(importance_type="gain"), strict=True),
                         key=lambda x: -x[1])
     for n, imp in importance[:20]:
         print(f"  {n:30s} {imp:>10.1f}")
 
     if args.save:
-        print(f"\nTraining final model on full data and saving ...")
+        print("\nTraining final model on full data and saving ...")
         model = train_one(X, y)
         with open(args.model_path, "wb") as f:
             pickle.dump({"model": model, "feature_names": names, "threshold": args.threshold}, f)

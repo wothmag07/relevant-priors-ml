@@ -7,8 +7,7 @@ Relevance is then determined primarily by region-set overlap.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import FrozenSet, Optional
+from dataclasses import dataclass
 
 
 def _norm(s: str) -> str:
@@ -142,15 +141,15 @@ PLAIN_REGION_FALLBACK = {
 
 @dataclass(frozen=True)
 class StudyTags:
-    regions: FrozenSet[str]
-    modality: Optional[str]
-    contrast: Optional[str]  # 'with' | 'without' | 'with_without' | None
-    laterality: Optional[str]  # 'left' | 'right' | 'bilateral' | None
+    regions: frozenset[str]
+    modality: str | None
+    contrast: str | None  # 'with' | 'without' | 'with_without' | None
+    laterality: str | None  # 'left' | 'right' | 'bilateral' | None
     is_outside: bool = False
     raw_norm: str = ""
 
 
-def _detect_contrast(s: str) -> Optional[str]:
+def _detect_contrast(s: str) -> str | None:
     has_with = bool(re.search(r"\bW\b|\bWITH\b|\bW/\b|\bW CON\b|\bWITH CON\w*\b|\bWITH CNTR\w*\b|\bW CNTR\w*\b", s))
     has_without = bool(re.search(r"\bWO\b|\bWITHOUT\b|\bW/O\b|\bWO CON\b|\bWITHOUT CON\w*\b|\bWITHOUT CNTR\w*\b|\bWO CNTR\w*\b", s))
     # combined like "wo/w" or "WITHOUT/WITH"
@@ -165,7 +164,7 @@ def _detect_contrast(s: str) -> Optional[str]:
     return None
 
 
-def _detect_laterality(s: str) -> Optional[str]:
+def _detect_laterality(s: str) -> str | None:
     if re.search(r"\bBI\b|\bBIL\b|\bBILAT\w*\b|\bBOTH\b", s):
         return "bilateral"
     has_left = bool(re.search(r"\bLEFT\b|\bLT\b|\bL\b(?! SPINE)", s))
@@ -227,7 +226,7 @@ def parse_description(description: str) -> StudyTags:
             if word in s and len(s) <= len(word) + 4:
                 regions.add(region)
 
-    modality: Optional[str] = None
+    modality: str | None = None
     for pat, mod in MODALITY_PATTERNS:
         if re.search(pat, s):
             modality = mod

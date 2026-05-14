@@ -11,7 +11,6 @@ import os
 import pickle
 import threading
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
@@ -62,7 +61,7 @@ def _load_once() -> bool:
                     "Classifier tier disabled — retrain via "
                     "`python -m eval.train_classifier --save`.",
                     len(saved_names), len(live_names),
-                    next((i for i, (a, b) in enumerate(zip(saved_names, live_names)) if a != b), -1),
+                    next((i for i, (a, b) in enumerate(zip(saved_names, live_names, strict=False)) if a != b), -1),
                     saved_names[: len(live_names)],
                     live_names[: len(saved_names)],
                 )
@@ -88,8 +87,8 @@ def is_available() -> bool:
 
 
 def predict_batch(
-    pairs: list[tuple[str, str, Optional[str], Optional[str], StudyTags, StudyTags]],
-) -> Optional[list[bool]]:
+    pairs: list[tuple[str, str, str | None, str | None, StudyTags, StudyTags]],
+) -> list[bool] | None:
     """Predict for a batch of (curr_desc, prior_desc, curr_date, prior_date, curr_tags, prior_tags).
 
     Returns None if the model is not loaded; otherwise returns one bool per pair.
@@ -98,6 +97,8 @@ def predict_batch(
         return None
     if not pairs:
         return []
+
+    assert _model is not None and _feature_names is not None  # noqa: S101  # invariant after _load_once() returns True
 
     n = len(pairs)
     X = np.zeros((n, len(_feature_names)), dtype=np.float32)

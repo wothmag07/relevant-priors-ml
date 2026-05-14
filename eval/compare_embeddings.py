@@ -23,11 +23,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-import numpy as np  # noqa: E402
 import lightgbm as lgb  # noqa: E402
+import numpy as np  # noqa: E402
 from sklearn.model_selection import GroupKFold  # noqa: E402
 
-from app.features import featurize, feature_names  # noqa: E402
+from app.features import feature_names, featurize  # noqa: E402
 
 DEFAULT_JSON = ROOT / "relevant_priors_public.json"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -64,7 +64,7 @@ def precompute_embeddings(rows):
     t0 = time.perf_counter()
     embs = model.encode(unique, normalize_embeddings=True, show_progress_bar=False, batch_size=64)
     print(f"  done in {time.perf_counter() - t0:.1f}s — embedding dim={embs.shape[1]}")
-    return {d: e for d, e in zip(unique, embs)}
+    return dict(zip(unique, embs, strict=True))
 
 
 def build_base_matrix(rows):
@@ -124,22 +124,22 @@ def cv_score(X, y, groups, n_folds=5, label=""):
     gkf = GroupKFold(n_splits=n_folds)
     oof_proba = np.zeros(len(y), dtype=np.float32)
     fold_accs = []
-    for fold, (tr_idx, te_idx) in enumerate(gkf.split(X, y, groups), start=1):
-        params = dict(
-            objective="binary", metric="binary_logloss",
-            learning_rate=0.05, num_leaves=31, min_data_in_leaf=30,
-            feature_fraction=0.9, bagging_fraction=0.9, bagging_freq=5,
-            verbose=-1, n_jobs=-1,
-        )
+    for _fold, (tr_idx, te_idx) in enumerate(gkf.split(X, y, groups), start=1):
+        params = {
+            "objective": "binary", "metric": "binary_logloss",
+            "learning_rate": 0.05, "num_leaves": 31, "min_data_in_leaf": 30,
+            "feature_fraction": 0.9, "bagging_fraction": 0.9, "bagging_freq": 5,
+            "verbose": -1, "n_jobs": -1,
+        }
         model = lgb.train(params, lgb.Dataset(X[tr_idx], label=y[tr_idx]), num_boost_round=300)
-        proba = model.predict(X[te_idx])
+        proba = np.asarray(model.predict(X[te_idx]))
         oof_proba[te_idx] = proba
         acc = ((proba >= 0.5).astype(int) == y[te_idx]).mean()
         fold_accs.append(acc)
     pred = (oof_proba >= 0.5).astype(int)
     overall = (pred == y).mean()
-    confusion = Counter()
-    for t, p in zip(y, pred):
+    confusion: Counter = Counter()
+    for t, p in zip(y, pred, strict=True):
         confusion[(bool(t), bool(p))] += 1
     print(f"\n=== {label} ===")
     print(f"  features: {X.shape[1]}")
@@ -181,7 +181,7 @@ def main():
     # Top features in 3b for diagnosis
     print("\nTop 15 features in Option 3b (last fold):")
     all_names = base_names + e2_names
-    importance = sorted(zip(all_names, m3b.feature_importance(importance_type="gain")),
+    importance = sorted(zip(all_names, m3b.feature_importance(importance_type="gain"), strict=True),
                         key=lambda x: -x[1])
     for n, imp in importance[:15]:
         marker = "  <- embedding" if n.startswith("emb_") else ""

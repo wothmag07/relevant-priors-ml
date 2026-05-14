@@ -16,8 +16,8 @@ import json
 import sys
 import time
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -58,10 +58,10 @@ def score(
 
     pair_to_descs: dict[tuple[str, str], tuple[str, str]] = {}
     for c in cases:
-        for p in c.prior_studies:
-            pair_to_descs[(c.case_id, p.study_id)] = (
+        for prior in c.prior_studies:
+            pair_to_descs[(c.case_id, prior.study_id)] = (
                 c.current_study.study_description,
-                p.study_description,
+                prior.study_description,
             )
 
     for key, label in truth.items():
@@ -139,7 +139,7 @@ def make_predictor(name: str) -> Callable[[list[Case]], list[Prediction]]:
         return heuristic
 
     if name == "classifier":
-        from app.classifier_model import predict_batch, is_available
+        from app.classifier_model import is_available, predict_batch
         from app.parser import parse_description
 
         if not is_available():
@@ -162,9 +162,10 @@ def make_predictor(name: str) -> Callable[[list[Case]], list[Prediction]]:
                     ))
                     keys.append((c.case_id, p.study_id))
             preds = predict_batch(pairs)
+            assert preds is not None, "classifier model unavailable during eval"  # noqa: S101
             return [
                 Prediction(case_id=k[0], study_id=k[1], predicted_is_relevant=p)
-                for k, p in zip(keys, preds)
+                for k, p in zip(keys, preds, strict=True)
             ]
         return classifier
 

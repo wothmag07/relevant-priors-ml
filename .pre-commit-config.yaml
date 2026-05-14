@@ -1,0 +1,39 @@
+# Run with: pre-commit install   (one time, sets up the git hook)
+#           pre-commit run --all-files   (manually run all hooks now)
+#
+# These hooks fire on `git commit` and block the commit if anything fails.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: \.md$
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=2048]   # the classifier pickle is ~1MB; raise if it grows
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.5.7
+    hooks:
+      - id: ruff
+        args: [--fix]
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      - id: mypy
+        files: ^(app|eval)/
+        additional_dependencies:
+          - numpy>=1.26
+          - pydantic>=2.9
+
+  - repo: local
+    hooks:
+      - id: plots-stale-when-model-changes
+        name: Warn if docs/*.png is stale after model/feature changes
+        language: system
+        entry: python scripts/check_plots_stale.py
+        files: ^(app/features\.py|app/heuristic\.py|app/parser\.py|app/classifier_model\.pkl)$
+        pass_filenames: false

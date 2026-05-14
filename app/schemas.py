@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import List, Optional
-
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -10,26 +8,26 @@ class Study(BaseModel):
 
     study_id: str
     study_description: str = ""
-    study_date: Optional[str] = None
+    study_date: str | None = None
 
 
 class Case(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     case_id: str
-    patient_id: Optional[str] = None
-    patient_name: Optional[str] = None
+    patient_id: str | None = None
+    patient_name: str | None = None
     current_study: Study
-    prior_studies: List[Study] = Field(default_factory=list)
+    prior_studies: list[Study] = Field(default_factory=list)
 
 
 class PredictRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    challenge_id: Optional[str] = None
-    schema_version: Optional[int] = None
-    generated_at: Optional[str] = None
-    cases: List[Case]
+    challenge_id: str | None = None
+    schema_version: int | None = None
+    generated_at: str | None = None
+    cases: list[Case]
 
 
 class Prediction(BaseModel):
@@ -39,4 +37,4 @@ class Prediction(BaseModel):
 
 
 class PredictResponse(BaseModel):
-    predictions: List[Prediction]
+    predictions: list[Prediction]

@@ -80,7 +80,7 @@ async def _handle(req: PredictRequest, request_id: str) -> PredictResponse:
         predictions = await asyncio.wait_for(
             predict_cases_async(req.cases, request_id=request_id), timeout=budget_s
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning(
             "request_id=%s exceeded budget=%.0fs; returning all-False fallback",
             request_id, budget_s,

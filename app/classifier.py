@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Iterable
+from collections.abc import Iterable
 
-from app.classifier_model import is_available as _classifier_available, predict_batch as _classifier_predict
+from app.classifier_model import is_available as _classifier_available
+from app.classifier_model import predict_batch as _classifier_predict
 from app.heuristic import classify_pair
 from app.parser import parse_description
 from app.schemas import Case, Prediction
@@ -47,9 +48,10 @@ def _predict_via_classifier(cases: list[Case]) -> list[Prediction]:
             ))
             keys.append((c.case_id, p.study_id))
     preds = _classifier_predict(pairs)
+    assert preds is not None, "_predict_via_classifier called when classifier unavailable"  # noqa: S101
     return [
         Prediction(case_id=k[0], study_id=k[1], predicted_is_relevant=p)
-        for k, p in zip(keys, preds)
+        for k, p in zip(keys, preds, strict=True)
     ]
 
 

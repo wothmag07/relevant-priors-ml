@@ -18,11 +18,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from math import log1p
-from typing import Optional
 
 from app.heuristic import _expand_regions, classify_pair
 from app.parser import StudyTags, parse_description
-
 
 # Top region tags by occurrence in the public split. Anything outside this list
 # is encoded only via the generic n_regions / overlap signals.
@@ -56,7 +54,7 @@ class FeatureBundle:
     values: list[float]
 
 
-def _parse_date(s: Optional[str]) -> Optional[datetime]:
+def _parse_date(s: str | None) -> datetime | None:
     if not s:
         return None
     try:
@@ -74,10 +72,10 @@ def _shared_tokens(a: str, b: str) -> int:
 def featurize(
     curr_desc: str,
     prior_desc: str,
-    curr_date: Optional[str] = None,
-    prior_date: Optional[str] = None,
-    curr_tags: Optional[StudyTags] = None,
-    prior_tags: Optional[StudyTags] = None,
+    curr_date: str | None = None,
+    prior_date: str | None = None,
+    curr_tags: StudyTags | None = None,
+    prior_tags: StudyTags | None = None,
 ) -> FeatureBundle:
     if curr_tags is None:
         curr_tags = parse_description(curr_desc)

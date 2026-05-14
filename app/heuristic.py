@@ -9,7 +9,6 @@ from dataclasses import dataclass
 
 from app.parser import StudyTags, parse_description
 
-
 # Region pairs that are *related but not identical* — both should be treated
 # as overlapping for relevance purposes. Symmetric. Each entry below was
 # validated against the public split: only kept where positive cases >> negative.

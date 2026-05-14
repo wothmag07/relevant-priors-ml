@@ -11,7 +11,6 @@ from __future__ import annotations
 from app.heuristic import _regions_overlap, classify_pair
 from app.parser import parse_description
 
-
 # ---------------------------------------------------------------------------
 # Region tagging
 # ---------------------------------------------------------------------------
